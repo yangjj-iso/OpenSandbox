@@ -76,28 +76,60 @@ func TestStreamSSEReadErrorDiscardsPendingEvent(t *testing.T) {
 }
 
 func TestRunCommandTruncatedHTTPBodyPreservesReadError(t *testing.T) {
-	for _, background := range []bool{false, true} {
-		t.Run(fmt.Sprintf("background=%t", background), func(t *testing.T) {
-			payload := "event: stdout\ndata: kept\n\nevent: execution_complete\ndata: {\"type\":\"execution_complete\"}\n"
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "text/event-stream")
-				w.Header().Set("Content-Length", fmt.Sprint(len(payload)+10))
-				_, _ = io.WriteString(w, payload)
-			}))
-			defer server.Close()
-			client := NewExecdClient(server.URL, "tok")
-			var events []StreamEvent
-			err := client.RunCommand(context.Background(), RunCommandRequest{Command: "echo hello", Background: background}, func(event StreamEvent) error {
-				events = append(events, event)
-				return nil
+	const rawStdout = `{"type":"stdout","text":"kept"}`
+	const rawComplete = `{"type":"execution_complete"}`
+
+	for _, tc := range []struct {
+		name      string
+		payload   string
+		truncated bool
+		want      []StreamEvent
+	}{
+		{
+			name:      "standard SSE block",
+			payload:   "event: stdout\ndata: kept\n\nevent: execution_complete\ndata: {\"type\":\"execution_complete\"}\n",
+			truncated: true,
+			want:      []StreamEvent{{Event: "stdout", Data: "kept"}},
+		},
+		{
+			name:      "raw JSON tail on read error",
+			payload:   rawStdout + "\n\n" + rawComplete,
+			truncated: true,
+			want:      []StreamEvent{{Event: "stdout", Data: rawStdout}},
+		},
+		{
+			name:    "raw JSON tail on clean EOF",
+			payload: rawStdout + "\n\n" + rawComplete,
+			want:    []StreamEvent{{Event: "stdout", Data: rawStdout}, {Event: "execution_complete", Data: rawComplete}},
+		},
+	} {
+		for _, background := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/background=%t", tc.name, background), func(t *testing.T) {
+				contentLength := len(tc.payload)
+				var wantErr error
+				if tc.truncated {
+					contentLength += 10
+					wantErr = io.ErrUnexpectedEOF
+				}
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.Header().Set("Content-Length", fmt.Sprint(contentLength))
+					_, _ = io.WriteString(w, tc.payload)
+				}))
+				defer server.Close()
+				client := NewExecdClient(server.URL, "tok")
+				var events []StreamEvent
+				err := client.RunCommand(context.Background(), RunCommandRequest{Command: "echo hello", Background: background}, func(event StreamEvent) error {
+					events = append(events, event)
+					return nil
+				})
+				if !errors.Is(err, wantErr) {
+					t.Errorf("error = %v, want %v", err, wantErr)
+				}
+				if !reflect.DeepEqual(events, tc.want) {
+					t.Errorf("events = %#v, want %#v", events, tc.want)
+				}
 			})
-			if !errors.Is(err, io.ErrUnexpectedEOF) {
-				t.Errorf("error = %v, want HTTP body truncation error", err)
-			}
-			want := []StreamEvent{{Event: "stdout", Data: "kept"}}
-			if !reflect.DeepEqual(events, want) {
-				t.Errorf("events = %#v, want %#v", events, want)
-			}
-		})
+		}
 	}
 }
