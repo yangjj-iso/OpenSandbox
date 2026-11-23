@@ -75,6 +75,36 @@ func TestStreamSSEReadErrorDiscardsPendingEvent(t *testing.T) {
 	}
 }
 
+func TestStreamSSEKeepsDelimitedRawEventsFromReadWithError(t *testing.T) {
+	const rawStdout = `{"type":"stdout","text":"kept"}`
+	const rawComplete = `{"type":"execution_complete"}`
+
+	for _, ending := range []struct{ name, value string }{{"LF", "\n"}, {"CRLF", "\r\n"}, {"CR", "\r"}} {
+		t.Run(ending.name, func(t *testing.T) {
+			payload := rawStdout + ending.value + rawComplete
+			body := &sseLineEndingBody{Reader: sseLineEndingReadFunc(func(buf []byte) (int, error) {
+				if len(buf) < len(payload) {
+					t.Fatal("expected the entire payload to fit in a single read")
+				}
+				return copy(buf, payload), io.ErrUnexpectedEOF
+			})}
+
+			var events []StreamEvent
+			err := streamSSE(context.Background(), &http.Response{Body: body}, func(event StreamEvent) error {
+				events = append(events, event)
+				return nil
+			})
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Errorf("error = %v, want original read error", err)
+			}
+			want := []StreamEvent{{Event: "stdout", Data: rawStdout}}
+			if !reflect.DeepEqual(events, want) {
+				t.Errorf("events = %#v, want %#v", events, want)
+			}
+		})
+	}
+}
+
 func TestRunCommandTruncatedHTTPBodyPreservesReadError(t *testing.T) {
 	const rawStdout = `{"type":"stdout","text":"kept"}`
 	const rawComplete = `{"type":"execution_complete"}`
